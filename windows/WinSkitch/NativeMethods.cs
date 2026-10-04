@@ -69,6 +69,13 @@ internal static class NativeMethods
     internal static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
 
     [DllImport("user32.dll")]
+    internal static extern IntPtr GetWindow(IntPtr window, uint command);
+
+    [DllImport("user32.dll", EntryPoint = "PostMessageW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool IsWindowVisible(IntPtr window);
 

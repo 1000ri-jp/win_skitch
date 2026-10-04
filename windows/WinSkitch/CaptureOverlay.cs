@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
@@ -13,10 +14,10 @@ namespace WinSkitch;
 
 public static class CaptureOverlay
 {
-    public static Task<Int32Rect?> SelectAsync(DesktopCapture capture)
+    public static Task<Int32Rect?> SelectAsync(DesktopCapture capture, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(capture);
-        var session = new SelectionSession(capture);
+        var session = new SelectionSession(capture, cancellationToken);
         return session.Start();
     }
 
@@ -28,6 +29,8 @@ public static class CaptureOverlay
         private readonly List<OverlayWindow> _windows = new();
         private readonly TaskCompletionSource<Int32Rect?> _result = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly DispatcherTimer _timer;
+        private readonly CancellationToken _cancellationToken;
+        private CancellationTokenRegistration _cancellationRegistration;
         private NativeMethods.Point _cursor;
         private NativeMethods.Point? _start;
         private OverlayWindow? _capturingWindow;
@@ -37,9 +40,10 @@ public static class CaptureOverlay
         internal NativeMethods.Point Cursor => _cursor;
         internal bool Dragging => _dragging;
 
-        internal SelectionSession(DesktopCapture capture)
+        internal SelectionSession(DesktopCapture capture, CancellationToken cancellationToken)
         {
             _capture = capture;
+            _cancellationToken = cancellationToken;
             _timer = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(16) };
             _timer.Tick += Poll;
         }
@@ -49,6 +53,7 @@ public static class CaptureOverlay
             Application.Current?.Dispatcher.VerifyAccess();
             try
             {
+                _cancellationToken.ThrowIfCancellationRequested();
                 foreach (var monitor in ScreenCapture.Monitors())
                 {
                     var bounds = ScreenCapture.Intersect(monitor, _capture.Bounds);
@@ -65,6 +70,9 @@ public static class CaptureOverlay
                     break;
                 }
                 _timer.Start();
+                var dispatcher = Dispatcher.CurrentDispatcher;
+                _cancellationRegistration = _cancellationToken.Register(() =>
+                    dispatcher.BeginInvoke(new Action(() => Finish(null))));
             }
             catch (Exception exception)
             {
@@ -136,6 +144,7 @@ public static class CaptureOverlay
         {
             if (_finished) return;
             _finished = true;
+            _cancellationRegistration.Dispose();
             _timer.Stop();
             _timer.Tick -= Poll;
             Mouse.Capture(null);

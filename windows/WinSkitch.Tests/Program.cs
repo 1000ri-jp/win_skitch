@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
@@ -37,7 +39,19 @@ internal static class Program
         Run("high-DPI inputs retain physical pixel dimensions", NormalizeDpi);
         Run("flatten replaces transparent pixels with white", TransparentFlatten);
         Run("PNG and JPEG save, reopen, and release file handles", SaveAndReopen);
+        Run("saved image and video history persists after restart and retains moved files", SavedHistoryRoundTrip);
+        Run("saved history keeps the newest twenty destinations and refreshes repeated Windows paths", SavedHistoryLimit);
+        Run("saved history tolerates damaged JSON and skips invalid records without losing valid entries", SavedHistoryDamagedData);
+        Run("history persistence failure preserves old data and keeps the successful save in memory", SavedHistoryWriteFailure);
+        Run("saved history window renders long Japanese paths and updates available actions without shell launches", SavedHistoryWindowRender);
+        Run("main window records only completed image saves in its injected history", MainWindowSaveHistory);
         Run("synthetic desktop cropping handles negative global coordinates", DesktopCropping);
+        Run("synthetic video frames encode to a playable MP4 with timing and changing colors", VideoRoundTrip);
+        Run("odd capture sizes retain content and pad MP4 dimensions to even pixels", VideoOddDimensions);
+        Run("abandoned video preserves existing output and removes temporary files", VideoAbort);
+        Run("invalid and empty video input fails without publishing partial output", VideoInvalidInput);
+        Run("a locked video destination preserves the finished recording for recovery", VideoPublishFailure);
+        Run("recording controls show elapsed time and save state without opening a window", RecordingControls);
         Run("text editing commits, undoes, and restores visibility", TextEditing);
         Run("launch arguments distinguish tray startup from editor and image startup", LaunchArguments);
         Run("launch arguments reject ambiguous startup requests", InvalidLaunchArguments);
@@ -280,6 +294,202 @@ internal static class Program
         }
     }
 
+    private static string SavedHistoryTestDirectory(string scenario)
+    {
+        string directory = Path.Combine(_output, "saved-history", scenario + "-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static string CreateHistoryFile(string directory, string fileName)
+    {
+        string path = Path.Combine(directory, fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "Synthetic saved-file history fixture. No desktop or player access.");
+        return path;
+    }
+
+    private static void SavedHistoryRoundTrip()
+    {
+        string directory = SavedHistoryTestDirectory("restart");
+        string storage = Path.Combine(directory, "settings", "history.json");
+        string png = CreateHistoryFile(directory, "説明画像.png");
+        string jpeg = CreateHistoryFile(directory, "共有画像.jpg");
+        string video = CreateHistoryFile(directory, "操作動画.mp4");
+        var history = new SavedFileHistory(storage);
+        foreach (string path in new[] { png, jpeg, video })
+            Check(history.Add(path), "a completed save should persist its destination");
+        var beforeRestart = history.Entries.ToArray();
+        File.Delete(png);
+        var restored = new SavedFileHistory(storage);
+        Equal(3, restored.Entries.Count, "image and video history survives a new instance");
+        Check(beforeRestart.SequenceEqual(restored.Entries), "restart must retain destination order and save timestamps");
+        Check(restored.Entries.Any(entry => entry.FilePath == png), "moved or deleted files retain their original folder in history");
+        Check(restored.LastError is null, "a missing saved file must not be mistaken for corrupt history");
+    }
+
+    private static void SavedHistoryLimit()
+    {
+        string directory = SavedHistoryTestDirectory("newest-twenty");
+        string storage = Path.Combine(directory, "settings", "history.json");
+        var history = new SavedFileHistory(storage);
+        string[] paths = Enumerable.Range(0, 23)
+            .Select(index => CreateHistoryFile(directory, $"capture-{index:D2}.png")).ToArray();
+        foreach (string path in paths) Check(history.Add(path), "fixture destination must be persisted");
+        Equal(20, history.Entries.Count, "history should remain bounded after more than twenty saves");
+        Check(paths.Skip(3).Reverse().SequenceEqual(history.Entries.Select(entry => entry.FilePath)),
+            "the twenty most recent saves should be presented newest first");
+
+        string repeated = Path.Combine(directory, ".", Path.GetFileName(paths[8])).ToUpperInvariant();
+        Check(history.Add(repeated), "saving again should accept equivalent absolute Windows paths");
+        Equal(20, history.Entries.Count, "saving an existing destination must not consume an extra slot");
+        Equal(Path.GetFullPath(repeated), history.Entries[0].FilePath, "the repeated normalized path should move to the top");
+        Equal(1, history.Entries.Count(entry => string.Equals(entry.FilePath, paths[8], StringComparison.OrdinalIgnoreCase)),
+            "paths that differ only by casing refer to the same history destination");
+        Check(history.Entries.Select(entry => entry.FilePath).SequenceEqual(new SavedFileHistory(storage).Entries.Select(entry => entry.FilePath)),
+            "the bounded deduplicated history must survive restart");
+
+        // Simulate an older writer or manually reordered settings file rather than relying on Add's own ordering.
+        File.WriteAllText(storage, JsonSerializer.Serialize(history.Entries.Reverse()
+            .Concat(new[] { new SavedFileEntry(paths[8], DateTimeOffset.UnixEpoch) })
+            .Concat(paths.Take(3).Select(path => new SavedFileEntry(path, DateTimeOffset.UnixEpoch)))));
+        var reordered = new SavedFileHistory(storage);
+        Check(history.Entries.SequenceEqual(reordered.Entries),
+            "loading must sort timestamps, retain the newest casing-insensitive duplicate, and discard excess older records");
+    }
+
+    private static void SavedHistoryDamagedData()
+    {
+        string directory = SavedHistoryTestDirectory("damaged-data");
+        foreach (string damaged in new[] { "{ invalid json", "{}", "null" })
+        {
+            string storage = Path.Combine(directory, "broken-" + Guid.NewGuid().ToString("N") + ".json");
+            File.WriteAllText(storage, damaged);
+            var history = new SavedFileHistory(storage);
+            Equal(0, history.Entries.Count, "invalid history should allow startup with an empty list");
+            Check(!string.IsNullOrWhiteSpace(history.LastError), "invalid history should report a recoverable warning");
+            string recovered = CreateHistoryFile(directory, "recovered.mp4");
+            Check(history.Add(recovered), "a subsequent successful save should recover damaged history");
+            Equal(recovered, new SavedFileHistory(storage).Entries.Single().FilePath, "recovered history should be loadable");
+        }
+
+        string valid = Path.Combine(directory, "以前の保存先", "移動済み.png");
+        string mixedStorage = Path.Combine(directory, "mixed.json");
+        DateTimeOffset savedAt = DateTimeOffset.Parse("2026-10-04T10:20:30+09:00");
+        File.WriteAllText(mixedStorage, JsonSerializer.Serialize(new object?[]
+        {
+            new { FilePath = valid, SavedAt = savedAt }, null,
+            new { FilePath = "", SavedAt = savedAt },
+            new { FilePath = "relative.png", SavedAt = savedAt },
+            new { FilePath = directory + "\\invalid\0.png", SavedAt = savedAt },
+            new { FilePath = valid, SavedAt = "invalid date" },
+            new { FilePath = 42, SavedAt = savedAt }
+        }));
+        var mixed = new SavedFileHistory(mixedStorage);
+        Equal(1, mixed.Entries.Count, "invalid individual records must not discard a valid saved destination");
+        Equal(valid, mixed.Entries[0].FilePath, "a valid missing file still represents a useful saved destination");
+        Equal(savedAt, mixed.Entries[0].SavedAt, "loading must preserve the save timestamp including its offset");
+        Check(!string.IsNullOrWhiteSpace(mixed.LastError), "skipped invalid records should produce a warning");
+    }
+
+    private static void SavedHistoryWriteFailure()
+    {
+        string directory = SavedHistoryTestDirectory("locked-settings");
+        string storage = Path.Combine(directory, "settings", "history.json");
+        string first = CreateHistoryFile(directory, "first.png");
+        string completedVideo = CreateHistoryFile(directory, "completed-video.mp4");
+        var history = new SavedFileHistory(storage);
+        Check(history.Add(first), "initial history should be persisted before the lock");
+        byte[] original = File.ReadAllBytes(storage);
+        int changed = 0;
+        history.Changed += () => changed++;
+        using (var locked = new FileStream(storage, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Check(!history.Add(completedVideo), "a locked history file should report persistence failure without throwing");
+            Equal(completedVideo, history.Entries[0].FilePath, "the saved video should remain discoverable for this session");
+            Check(!string.IsNullOrWhiteSpace(history.LastError), "persistence failure should explain that history could not be written");
+            Equal(1, changed, "an open history window must be notified of the in-memory update after failed persistence");
+            Check(File.Exists(completedVideo), "history failure must leave the successfully saved file intact");
+        }
+        Check(original.SequenceEqual(File.ReadAllBytes(storage)), "failed atomic publication must preserve the prior history file");
+        Equal(first, new SavedFileHistory(storage).Entries.Single().FilePath, "the prior on-disk history must remain valid");
+        Equal(1, Directory.GetFiles(Path.GetDirectoryName(storage)!).Length, "a failed write must clean up its temporary settings file");
+        Check(history.Add(completedVideo), "retry after releasing the lock should persist the complete history");
+        Check(history.LastError is null, "a successful retry should clear the persistence warning");
+        Equal(2, new SavedFileHistory(storage).Entries.Count, "retry should include both the earlier and completed destinations");
+    }
+
+    private static void SavedHistoryWindowRender()
+    {
+        string directory = SavedHistoryTestDirectory("window");
+        var history = new SavedFileHistory(Path.Combine(directory, "settings", "history.json"));
+        var window = new SaveHistoryWindow(history);
+        Check(window.Content is FrameworkElement, "history must contain an offscreen-renderable WPF layout");
+        var content = (FrameworkElement)window.Content;
+        if (content is Panel panel && panel.Background is null) panel.Background = window.Background;
+        BitmapSource empty = RenderElement(content, 860, 540);
+        Check(window.EmptyState.Visibility == Visibility.Visible, "empty history should explain how to populate the list");
+        Check(!window.OpenFileButton.IsEnabled && !window.OpenFolderButton.IsEnabled,
+            "empty history must disable actions that require a destination");
+        SavePng(empty, "saved-history-empty.png");
+
+        string japaneseFolder = Path.Combine(directory, "共有する資料と操作動画の保存先 " + new string('保', 55));
+        string image = CreateHistoryFile(japaneseFolder, "注釈画像 " + new string('画', 28) + ".png");
+        string video = CreateHistoryFile(japaneseFolder, "操作説明動画 " + new string('動', 28) + ".mp4");
+        Check(history.Add(image) && history.Add(video), "fixture saves must populate the already-created history window");
+        BitmapSource populated = RenderElement(content, 860, 540);
+        Equal(2, window.HistoryList.Items.Count, "history change events must update an existing window");
+        Equal(video, window.SelectedEntry!.FilePath, "the latest saved file should initially be selected");
+        Equal("保存先を開く", window.OpenFolderButton.Content.ToString()!, "folder action should have its Japanese label");
+        Equal("ファイルを開く", window.OpenFileButton.Content.ToString()!, "file action should have its Japanese label");
+        Check(window.OpenFileButton.IsEnabled && window.OpenFolderButton.IsEnabled, "existing saved files should offer both actions");
+        Equal(Visibility.Collapsed, window.EmptyState.Visibility, "populated history should replace the empty-state message");
+        Check(Descendants(content).OfType<TextBlock>().Any(text => text.Text == video || text.Text == Path.GetDirectoryName(video)),
+            "the long Japanese destination must be visible in the layout, not just retained internally");
+        Check(CountPixels(populated, pixel => pixel.A == 255) > 300_000, "saved history should render a complete usable dialog surface");
+        SavePng(populated, "saved-history-populated.png");
+
+        File.Delete(video);
+        window.Refresh();
+        Check(!window.OpenFileButton.IsEnabled && window.OpenFolderButton.IsEnabled,
+            "a deleted file must still allow its surviving save folder to open");
+        Check(!string.IsNullOrWhiteSpace(window.StatusText.Text), "deleted files should display an explanation");
+        SavePng(RenderElement(content, 860, 540), "saved-history-missing-file.png");
+        File.Delete(image);
+        Directory.Delete(japaneseFolder);
+        window.Refresh();
+        Check(!window.OpenFileButton.IsEnabled && !window.OpenFolderButton.IsEnabled,
+            "when both the saved file and its parent are gone, both actions must be disabled");
+        window.Close();
+    }
+
+    private static void MainWindowSaveHistory()
+    {
+        string directory = SavedHistoryTestDirectory("editor-save");
+        var history = new SavedFileHistory(Path.Combine(directory, "settings", "history.json"));
+        var window = new MainWindow(history);
+        window.Editor.Load(Checkerboard(80, 60));
+        string destination = Path.Combine(directory, "completed-image.png");
+        window.Editor.Document.Save(destination); // Establish a filename without opening a save dialog.
+        Layout((FrameworkElement)window.Content, 1000, 700);
+        Menu menu = Descendants((DependencyObject)window.Content).OfType<Menu>().Single();
+        MenuItem file = menu.Items.OfType<MenuItem>().Single(item => item.Header?.ToString() == "ファイル");
+        MenuItem save = file.Items.OfType<MenuItem>().Single(item => item.Header?.ToString() == "保存");
+        Check(file.Items.OfType<MenuItem>().Any(item => item.Header?.ToString() == "保存履歴…"),
+            "the File menu must provide access to saved history");
+        Check(Descendants((DependencyObject)window.Content).OfType<Button>().Any(button => button.Content?.ToString() == "履歴"),
+            "the toolbar must provide access to saved history");
+        using (var locked = new FileStream(destination, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            save.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            Equal(0, history.Entries.Count, "failed image writes must not appear as completed saves");
+        }
+        save.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Equal(destination, history.Entries.Single().FilePath, "the main window should remember a successfully saved image");
+        Equal(destination, new SavedFileHistory(Path.Combine(directory, "settings", "history.json")).Entries.Single().FilePath,
+            "image save integration should persist its destination without touching production settings");
+    }
+
     private static void DesktopCropping()
     {
         BitmapSource source = CoordinatePattern(80, 60);
@@ -297,6 +507,152 @@ internal static class Program
         try { ScreenCapture.Crop(capture, new Int32Rect(500, 500, 10, 10)); }
         catch (ArgumentOutOfRangeException) { rejected = true; }
         Check(rejected, "a wholly off-desktop crop must be rejected");
+    }
+
+    private static void VideoRoundTrip()
+    {
+        string path = Path.Combine(_output, "synthetic-video.mp4");
+        const int framesPerSecond = 15, frameCount = 30;
+        using (var writer = new MediaFoundationVideoWriter(path, 160, 96, framesPerSecond))
+        {
+            for (int i = 0; i < frameCount; i++)
+            {
+                long timestamp = i * 10_000_000L / framesPerSecond;
+                long nextTimestamp = (i + 1) * 10_000_000L / framesPerSecond;
+                writer.WriteFrame(Pixels(Solid(160, 96, i < 15 ? Colors.Red : Colors.Blue)), timestamp, nextTimestamp - timestamp);
+            }
+            writer.Finish();
+        }
+        DecodedVideo video = VideoReader.Decode(path);
+        Equal(160, video.Width, "MP4 width");
+        Equal(96, video.Height, "MP4 height");
+        Near(framesPerSecond, video.FramesPerSecond, 0.01, "MP4 frame rate");
+        Equal(frameCount, video.FrameCount, "all supplied frames should decode");
+        Near(2, video.DurationSeconds, 0.05, "video duration follows sample timestamps");
+        Check(video.First.R > 220 && video.First.G < 35 && video.First.B < 35, "decoded first frame must retain its red content");
+        Check(video.Last.B > 220 && video.Last.R < 35 && video.Last.G < 35, "decoded last frame must retain changed blue content");
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Check(exclusive.Length > 1000, "finished encoder and decoder must release the playable MP4 file");
+    }
+
+    private static void VideoOddDimensions()
+    {
+        string path = Path.Combine(_output, "synthetic-video-odd.mp4");
+        using (var writer = new MediaFoundationVideoWriter(path, 161, 97))
+        {
+            Equal(162, writer.Width, "odd width is padded without shrinking the capture");
+            Equal(98, writer.Height, "odd height is padded without shrinking the capture");
+            byte[] frame = Pixels(CreateBitmap(161, 97, (_, y) => y < 48 ? Colors.Red : Colors.Blue));
+            for (int i = 0; i < 4; i++)
+                writer.WriteFrame(frame, i * 666_667L, 666_667);
+            writer.Finish();
+        }
+        DecodedVideo video = VideoReader.Decode(path);
+        Equal(162, video.Width, "decoder observes even padded width");
+        Equal(98, video.Height, "decoder observes even padded height");
+        Equal(4, video.FrameCount, "odd sizes still produce all frames");
+        Check(video.FirstTop.R > 220 && video.FirstTop.G < 35 && video.FirstTop.B < 35,
+            "the red top band must remain at the top after encoding and padding");
+        Check(video.FirstBottom.B > 220 && video.FirstBottom.R < 35 && video.FirstBottom.G < 35,
+            "the blue bottom band must remain at the bottom after encoding and padding");
+    }
+
+    private static void VideoAbort()
+    {
+        string directory = Path.Combine(_output, "video-abort");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "existing.mp4");
+        byte[] original = { 21, 42, 63, 84 };
+        File.WriteAllBytes(path, original);
+        string[] before = Directory.GetFiles(directory).OrderBy(p => p).ToArray();
+        using (var writer = new MediaFoundationVideoWriter(path, 160, 96))
+        {
+            writer.WriteFrame(Pixels(Solid(160, 96, Colors.Red)), 0, 666_667);
+            Check(File.ReadAllBytes(path).SequenceEqual(original), "recording must keep the previous destination intact until it is finalized");
+        }
+        Check(File.ReadAllBytes(path).SequenceEqual(original), "abandoning an unfinished recording must preserve an existing destination");
+        Check(Directory.GetFiles(directory).OrderBy(p => p).SequenceEqual(before), "abandoning recording must remove its staging files");
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Equal((long)original.Length, exclusive.Length, "abort must release all destination handles");
+    }
+
+    private static void VideoInvalidInput()
+    {
+        string directory = Path.Combine(_output, "video-invalid");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".mp4");
+        string[] before = Directory.GetFiles(directory).OrderBy(p => p).ToArray();
+        using (var writer = new MediaFoundationVideoWriter(path, 160, 96))
+        {
+            bool rejected = false;
+            try { writer.WriteFrame(new byte[32], 0, 666_667); }
+            catch (ArgumentException) { rejected = true; }
+            Check(rejected, "an incomplete frame must be rejected before native memory is accessed");
+            rejected = false;
+            try { writer.Finish(); }
+            catch (InvalidOperationException) { rejected = true; }
+            Check(rejected, "an empty recording must not be published as a successful MP4");
+        }
+        Check(!File.Exists(path), "failed empty recording must not create a destination");
+        Check(Directory.GetFiles(directory).OrderBy(p => p).SequenceEqual(before), "invalid input must not leave partial output behind");
+    }
+
+    private static void VideoPublishFailure()
+    {
+        string directory = Path.Combine(_output, "video-publish-failure");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "existing.mp4");
+        byte[] original = { 12, 34, 56, 78 };
+        File.WriteAllBytes(path, original);
+        string[] before = Directory.GetFiles(directory).OrderBy(p => p).ToArray();
+        string? errorMessage = null;
+        using (var locked = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        using (var writer = new MediaFoundationVideoWriter(path, 160, 96))
+        {
+            for (int i = 0; i < 4; i++)
+                writer.WriteFrame(Pixels(Solid(160, 96, Colors.Red)), i * 666_667L, 666_667);
+            try { writer.Finish(); }
+            catch (IOException error) { errorMessage = error.Message; }
+            Check(errorMessage is not null, "publishing to an exclusively locked destination must fail visibly");
+        }
+        Check(File.ReadAllBytes(path).SequenceEqual(original), "publication failure must preserve the existing destination");
+        string[] recoveryFiles = Directory.GetFiles(directory).Except(before).ToArray();
+        Equal(1, recoveryFiles.Length, "a finalized recording must remain available for recovery");
+        string recoveryPath = recoveryFiles[0];
+        try
+        {
+            Check(errorMessage!.Contains(recoveryPath, StringComparison.OrdinalIgnoreCase), "the error must identify the recoverable recording path");
+            DecodedVideo video = VideoReader.Decode(recoveryPath);
+            Equal(4, video.FrameCount, "retained recording must contain all completed frames");
+            Check(video.First.R > 220 && video.First.G < 35 && video.First.B < 35,
+                "the retained file must remain a playable recording with the captured content");
+        }
+        finally { File.Delete(recoveryPath); }
+        Check(Directory.GetFiles(directory).OrderBy(p => p).SequenceEqual(before), "test cleanup must remove only its verified recovery file");
+    }
+
+    private static void RecordingControls()
+    {
+        Equal("00:59", RecordingControlsWindow.FormatElapsed(TimeSpan.FromSeconds(59)), "sub-minute timer");
+        Equal("01:00", RecordingControlsWindow.FormatElapsed(TimeSpan.FromMinutes(1)), "minute rollover");
+        Equal("01:01:01", RecordingControlsWindow.FormatElapsed(TimeSpan.FromSeconds(3661)), "recordings over an hour retain the full duration");
+        Equal("100:00:00", RecordingControlsWindow.FormatElapsed(TimeSpan.FromHours(100)), "elapsed hours must not wrap after a day");
+        int stopCalls = 0;
+        var window = new RecordingControlsWindow(() => TimeSpan.FromSeconds(59), () => stopCalls++);
+        var content = (FrameworkElement)window.Content;
+        if (content is Panel panel && panel.Background is null) panel.Background = window.Background;
+        Button stop = Descendants(content).OfType<Button>().Single();
+        Check(stop.IsEnabled, "recording must initially allow stopping");
+        Check(stop.Content.ToString()!.Contains("停止"), "stop action must be visible");
+        stop.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Equal(1, stopCalls, "stop button invokes recording completion");
+        BitmapSource image = RenderElement(content, 332, 80);
+        Check(CountPixels(image, p => p.R > p.G + 50 && p.R > p.B + 50) > 20, "recording state should have a visible red indicator");
+        SavePng(image, "recording-controls.png");
+        window.BeginSaving();
+        Check(!stop.IsEnabled, "saving must disable duplicate stop requests");
+        Check(stop.Content.ToString()!.Contains("保存中"), "finalization must expose its progress state");
+        window.CloseAfterRecording();
     }
 
     private static void TextEditing()
@@ -432,7 +788,7 @@ internal static class Program
     private static void MainWindowRender()
     {
         // No Show(), clipboard operations, global hotkeys, or desktop reads in this test.
-        var window = new MainWindow();
+        var window = new MainWindow(new SavedFileHistory(Path.Combine(SavedHistoryTestDirectory("main-render"), "history.json")));
         Check(window.Content is FrameworkElement, "main window must contain a WPF visual tree");
         var content = (FrameworkElement)window.Content;
         // RenderTargetBitmap draws the content visual, so include its real window backdrop.
@@ -469,6 +825,170 @@ internal static class Program
         image.Render(element);
         image.Freeze();
         return image;
+    }
+
+    private readonly record struct DecodedVideo(int Width, int Height, double FramesPerSecond,
+        int FrameCount, double DurationSeconds, Pixel First, Pixel Last, Pixel FirstTop, Pixel FirstBottom);
+
+    // Decode the synthetic output through Windows' real MP4/H.264 pipeline. COM slots and
+    // GUIDs follow Microsoft's WinSDK mfobjects.h, mfreadwrite.h, and mfapi.h declarations.
+    // This inspector uses no desktop capture, playback window, microphone, or clipboard.
+    private static class VideoReader
+    {
+        private const uint FirstVideoStream = 0xfffffffc;
+        private static readonly Guid FrameSize = new("1652c33d-d6b2-4012-b834-72030849a37d");
+        private static readonly Guid FrameRate = new("c459a2e8-3d2c-4e44-b132-fee5156c7bb0");
+
+        public static DecodedVideo Decode(string path)
+        {
+            uint apartment = Thread.CurrentThread.GetApartmentState() == ApartmentState.STA ? 2u : 0u;
+            Marshal.ThrowExceptionForHR(CoInitializeEx(IntPtr.Zero, apartment));
+            bool started = false;
+            IntPtr attributes = IntPtr.Zero, reader = IntPtr.Zero, nativeType = IntPtr.Zero, decodedType = IntPtr.Zero;
+            try
+            {
+                Marshal.ThrowExceptionForHR(MFStartup(0x20070, 0));
+                started = true;
+                Marshal.ThrowExceptionForHR(MFCreateAttributes(out attributes, 1));
+                Guid processing = new("fb394f3d-ccf1-42ee-bbb3-f9b845d5681d");
+                Marshal.ThrowExceptionForHR(Method<SetUInt32>(attributes, 21)(attributes, ref processing, 1));
+                Marshal.ThrowExceptionForHR(MFCreateSourceReaderFromURL(path, attributes, out reader));
+                Marshal.ThrowExceptionForHR(Method<GetNativeMediaType>(reader, 5)(reader, FirstVideoStream, 0, out nativeType));
+                ulong size = UInt64(nativeType, FrameSize), rate = UInt64(nativeType, FrameRate);
+                int width = checked((int)(size >> 32)), height = checked((int)(size & uint.MaxValue));
+                double framesPerSecond = (rate >> 32) / (double)(uint)rate;
+
+                Marshal.ThrowExceptionForHR(MFCreateMediaType(out decodedType));
+                Guid major = new("48eba18e-f8c9-4687-bf11-0a74c9f96a8f"), video = new("73646976-0000-0010-8000-00aa00389b71");
+                Guid subtype = new("f7e34c9a-42e8-4714-b74b-cb29d72c35e5"), rgb32 = new("00000016-0000-0010-8000-00aa00389b71");
+                Marshal.ThrowExceptionForHR(Method<SetGuid>(decodedType, 24)(decodedType, ref major, ref video));
+                Marshal.ThrowExceptionForHR(Method<SetGuid>(decodedType, 24)(decodedType, ref subtype, ref rgb32));
+                Marshal.ThrowExceptionForHR(Method<SetCurrentMediaType>(reader, 7)(reader, FirstVideoStream, IntPtr.Zero, decodedType));
+                Release(ref decodedType);
+                Marshal.ThrowExceptionForHR(Method<GetCurrentMediaType>(reader, 6)(reader, FirstVideoStream, out decodedType));
+                Guid defaultStride = new("644b4e48-1e02-4516-b0eb-c01ca9d49ac6");
+                int stride;
+                if (Method<GetUInt32>(decodedType, 7)(decodedType, ref defaultStride, out uint rawStride) >= 0)
+                    stride = unchecked((int)rawStride);
+                else
+                    Marshal.ThrowExceptionForHR(MFGetStrideForBitmapInfoHeader(22, (uint)width, out stride));
+                Check(Math.Abs(stride) >= checked(width * 4), "decoded RGB stride must cover an entire row");
+
+                int frameCount = 0;
+                long end = 0;
+                Pixel first = default, last = default, firstTop = default, firstBottom = default;
+                bool ended = false;
+                for (int attempt = 0; attempt < 1024; attempt++)
+                {
+                    IntPtr sample = IntPtr.Zero, buffer = IntPtr.Zero;
+                    try
+                    {
+                        Marshal.ThrowExceptionForHR(Method<ReadSample>(reader, 9)(reader, FirstVideoStream, 0,
+                            out _, out uint flags, out long timestamp, out sample));
+                        Check((flags & 1) == 0, "MP4 source reader must not report a decoding error");
+                        if (sample != IntPtr.Zero)
+                        {
+                            Marshal.ThrowExceptionForHR(Method<GetDuration>(sample, 37)(sample, out long duration));
+                            end = Math.Max(end, timestamp + duration);
+                            Marshal.ThrowExceptionForHR(Method<GetBuffer>(sample, 41)(sample, out buffer));
+                            Marshal.ThrowExceptionForHR(Method<LockBuffer>(buffer, 3)(buffer, out IntPtr data, out _, out uint length));
+                            try
+                            {
+                                Check(length >= checked(Math.Abs(stride) * height), "decoded frame must contain all requested RGB pixels");
+                                last = Probe(data, stride, height, width / 2, height / 2);
+                                if (frameCount == 0)
+                                {
+                                    first = last;
+                                    firstTop = Probe(data, stride, height, width / 2, height / 4);
+                                    firstBottom = Probe(data, stride, height, width / 2, height * 3 / 4);
+                                }
+                                frameCount++;
+                            }
+                            finally { Marshal.ThrowExceptionForHR(Method<UnlockBuffer>(buffer, 4)(buffer)); }
+                        }
+                        if ((flags & 2) != 0) { ended = true; break; }
+                    }
+                    finally { Release(ref buffer); Release(ref sample); }
+                }
+                Check(ended, "MP4 must decode to end of stream within the synthetic frame limit");
+                Check(frameCount > 0, "MP4 must expose at least one decoded video frame");
+                return new DecodedVideo(width, height, framesPerSecond, frameCount, end / 10_000_000.0, first, last, firstTop, firstBottom);
+            }
+            finally
+            {
+                Release(ref decodedType); Release(ref nativeType); Release(ref reader); Release(ref attributes);
+                if (started) MFShutdown();
+                CoUninitialize();
+            }
+        }
+
+        private static ulong UInt64(IntPtr attributes, Guid key)
+        {
+            Marshal.ThrowExceptionForHR(Method<GetUInt64>(attributes, 8)(attributes, ref key, out ulong value));
+            return value;
+        }
+
+        private static Pixel Probe(IntPtr data, int stride, int height, int x, int y)
+        {
+            // IMFMediaBuffer::Lock exposes the lowest address; a negative stride
+            // means the displayed top row starts at the last row in that buffer.
+            int top = stride < 0 ? checked(-stride * (height - 1)) : 0;
+            int offset = checked(top + y * stride + x * 4);
+            return new Pixel(Marshal.ReadByte(data, offset + 2), Marshal.ReadByte(data, offset + 1),
+                Marshal.ReadByte(data, offset), 255);
+        }
+
+        private static T Method<T>(IntPtr instance, int slot) where T : Delegate =>
+            Marshal.GetDelegateForFunctionPointer<T>(Marshal.ReadIntPtr(Marshal.ReadIntPtr(instance), slot * IntPtr.Size));
+
+        private static void Release(ref IntPtr instance)
+        {
+            if (instance != IntPtr.Zero) Marshal.Release(instance);
+            instance = IntPtr.Zero;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int SetUInt32(IntPtr instance, ref Guid key, uint value);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetUInt32(IntPtr instance, ref Guid key, out uint value);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetUInt64(IntPtr instance, ref Guid key, out ulong value);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int SetGuid(IntPtr instance, ref Guid key, ref Guid value);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetNativeMediaType(IntPtr instance, uint stream, uint index, out IntPtr mediaType);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetCurrentMediaType(IntPtr instance, uint stream, out IntPtr mediaType);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int SetCurrentMediaType(IntPtr instance, uint stream, IntPtr reserved, IntPtr mediaType);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int ReadSample(IntPtr instance, uint stream, uint control, out uint actualStream,
+            out uint flags, out long timestamp, out IntPtr sample);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetDuration(IntPtr instance, out long duration);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int GetBuffer(IntPtr instance, out IntPtr buffer);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int LockBuffer(IntPtr instance, out IntPtr data, out uint maximumLength, out uint currentLength);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate int UnlockBuffer(IntPtr instance);
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern int CoInitializeEx(IntPtr reserved, uint flags);
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        private static extern void CoUninitialize();
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFStartup(uint version, uint flags);
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFShutdown();
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFCreateAttributes(out IntPtr attributes, uint initialSize);
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFCreateMediaType(out IntPtr mediaType);
+        [DllImport("mfplat.dll", ExactSpelling = true)]
+        private static extern int MFGetStrideForBitmapInfoHeader(uint format, uint width, out int stride);
+        [DllImport("mfreadwrite.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int MFCreateSourceReaderFromURL(string url, IntPtr attributes, out IntPtr sourceReader);
     }
 
     private readonly record struct Pixel(byte R, byte G, byte B, byte A);

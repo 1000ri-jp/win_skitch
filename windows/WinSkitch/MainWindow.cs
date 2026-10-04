@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -19,8 +20,20 @@ public sealed class MainWindow : Window
 {
     public EditorSurface Editor { get; } = new();
     private WindowsHost? _host;
+    private readonly SavedFileHistory _savedFileHistory;
+    private SaveHistoryWindow? _historyWindow;
+    private readonly List<Control> _historyActions = new();
     internal bool HotkeysRegistered => _host is { FailedHotkeys: false };
     private bool _allowExit, _snapping;
+    private bool _recordingBusy, _exitRequested;
+    private bool _recordingSaveDialogOpen;
+    private VideoRecorder? _recorder;
+    private RecordingControlsWindow? _recordingControls;
+    private CancellationTokenSource? _recordingCancellation;
+    private Task? _recordingTask;
+    private readonly List<Control> _captureActions = new();
+    private readonly List<Control> _recordingStartActions = new();
+    private MenuItem? _stopRecordingItem;
     private Int32Rect? _previous;
     private readonly TextBlock _status = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _info = new() { VerticalAlignment = VerticalAlignment.Center, Foreground = GrayBrush };
@@ -49,8 +62,9 @@ public sealed class MainWindow : Window
         ["stamp"] = new[] { ("check", "✔ OK"), ("cross", "✖ NG"), ("question", "? 質問"), ("exclaim", "! 注意"), ("star", "★ スター"), ("heart", "♥ ハート") }
     };
 
-    public MainWindow()
+    public MainWindow(SavedFileHistory? history = null)
     {
+        _savedFileHistory = history ?? new SavedFileHistory();
         Title = "WinSkitch";
         Width = 1000; Height = 700; MinWidth = 480; MinHeight = 360;
         FontFamily = new FontFamily("Yu Gothic UI");
@@ -65,7 +79,9 @@ public sealed class MainWindow : Window
         _statusTimer.Tick += (_, _) => { _status.Text = ""; _statusTimer.Stop(); };
         SourceInitialized += (_, _) =>
         {
-            _host = new WindowsHost(this, mode => _ = SnapAsync(mode), ShowEditor, Exit, ToggleStartup);
+            _host = new WindowsHost(this, mode => _ = SnapAsync(mode), ShowEditor, Exit, ToggleStartup,
+                mode => _ = StartRecordingAsync(mode), () => _ = StopRecordingAsync(), ShowSaveHistory);
+            UpdateRecordingControls();
             if (_host.FailedHotkeys) ShowStatus("⚠ ホットキーを登録できませんでした（他のアプリが使用中の可能性）", 0);
         };
         Closing += OnClosing;
@@ -83,6 +99,7 @@ public sealed class MainWindow : Window
             e.Handled = true;
         };
         UpdateControls();
+        UpdateRecordingControls();
     }
 
     private void BuildLayout()
@@ -101,11 +118,25 @@ public sealed class MainWindow : Window
         more.Background = snap.Background;
         more.Click += (_, _) => ShowSnapMenu(more);
         actions.Children.Add(more);
+        _captureActions.Add(snap); _captureActions.Add(more);
+        var record = Button("● 録画", () => _ = StartRecordingAsync("region"));
+        record.Background = new SolidColorBrush(Color.FromRgb(160, 54, 54));
+        record.ToolTip = "範囲を選んでMP4動画を録画 (Ctrl+Shift+7)";
+        actions.Children.Add(record);
+        var recordMore = Button("▾", () => { });
+        recordMore.Background = record.Background;
+        recordMore.Click += (_, _) => ShowRecordingMenu(recordMore);
+        actions.Children.Add(recordMore);
+        _recordingStartActions.Add(record); _recordingStartActions.Add(recordMore);
         actions.Children.Add(Button("開く", OpenFile));
         var save = Button("保存", () => Save(false));
         var copy = Button("コピー", CopyImage);
         actions.Children.Add(save); actions.Children.Add(copy);
         _requiresImage.Add(save); _requiresImage.Add(copy);
+        var history = Button("履歴", ShowSaveHistory);
+        history.ToolTip = "保存した画像・動画のファイルや保存先を開きます";
+        actions.Children.Add(history);
+        _historyActions.Add(history);
         DockPanel.SetDock(actions, Dock.Left);
         top.Children.Add(actions);
         _info.Margin = new Thickness(0, 0, 12, 0);
@@ -208,14 +239,17 @@ public sealed class MainWindow : Window
     {
         var menu = new Menu();
         var file = new MenuItem { Header = "ファイル" };
-        file.Items.Add(MenuAction("範囲スナップ", () => _ = SnapAsync("region"), "Ctrl+Shift+5"));
-        file.Items.Add(MenuAction("全画面スナップ", () => _ = SnapAsync("full"), "Ctrl+Shift+6"));
+        file.Items.Add(CaptureMenuAction("範囲スナップ", () => _ = SnapAsync("region"), "Ctrl+Shift+5"));
+        file.Items.Add(CaptureMenuAction("全画面スナップ", () => _ = SnapAsync("full"), "Ctrl+Shift+6"));
         file.Items.Add(new Separator());
         file.Items.Add(MenuAction("開く…", OpenFile, "Ctrl+O"));
         var save = MenuAction("保存", () => Save(false), "Ctrl+S");
         var saveAs = MenuAction("名前を付けて保存…", () => Save(true), "Ctrl+Shift+S");
         file.Items.Add(save); file.Items.Add(saveAs);
         _requiresImage.Add(save); _requiresImage.Add(saveAs);
+        var history = MenuAction("保存履歴…", ShowSaveHistory);
+        file.Items.Add(history);
+        _historyActions.Add(history);
         file.Items.Add(new Separator());
         file.Items.Add(MenuAction("閉じる（トレイに格納）", HideEditor));
         file.Items.Add(MenuAction("終了", Exit));
@@ -231,8 +265,14 @@ public sealed class MainWindow : Window
         edit.Items.Add(MenuAction("選択を削除", Editor.DeleteSelected, "Delete"));
         menu.Items.Add(edit);
         var snap = new MenuItem { Header = "スナップ" };
-        foreach (var item in SnapItems()) snap.Items.Add(item);
+        foreach (var item in SnapItems(true)) snap.Items.Add(item);
         menu.Items.Add(snap);
+        var recording = new MenuItem { Header = "動画" };
+        recording.Items.Add(RecordingMenuAction("範囲を録画…", "region", "Ctrl+Shift+7"));
+        recording.Items.Add(RecordingMenuAction("モニター全体を録画…", "full"));
+        _stopRecordingItem = MenuAction("停止して保存", () => _ = StopRecordingAsync(), "Ctrl+Shift+7");
+        recording.Items.Add(_stopRecordingItem);
+        menu.Items.Add(recording);
         var settings = new MenuItem { Header = "設定" };
         _startupItem = new MenuItem { Header = "Windowsログイン時に起動", IsCheckable = true };
         _startupItem.Click += (_, _) => ToggleStartup();
@@ -242,12 +282,52 @@ public sealed class MainWindow : Window
         return menu;
     }
 
-    private IEnumerable<MenuItem> SnapItems()
+    private IEnumerable<MenuItem> SnapItems(bool trackControls = false)
     {
-        yield return MenuAction("範囲スナップ", () => _ = SnapAsync("region"), "Ctrl+Shift+5");
-        yield return MenuAction("全画面スナップ", () => _ = SnapAsync("full"), "Ctrl+Shift+6");
-        yield return MenuAction("タイマースナップ（5秒後）", () => _ = SnapAsync("timer"));
-        yield return MenuAction("前回の範囲でスナップ", () => _ = SnapAsync("previous"));
+        var items = new[]
+        {
+            MenuAction("範囲スナップ", () => _ = SnapAsync("region"), "Ctrl+Shift+5"),
+            MenuAction("全画面スナップ", () => _ = SnapAsync("full"), "Ctrl+Shift+6"),
+            MenuAction("タイマースナップ（5秒後）", () => _ = SnapAsync("timer")),
+            MenuAction("前回の範囲でスナップ", () => _ = SnapAsync("previous"))
+        };
+        foreach (var item in items)
+        {
+            if (trackControls) _captureActions.Add(item);
+            yield return item;
+        }
+    }
+
+    private MenuItem CaptureMenuAction(string title, Action action, string shortcut = "")
+    {
+        var item = MenuAction(title, action, shortcut);
+        _captureActions.Add(item);
+        return item;
+    }
+
+    private MenuItem RecordingMenuAction(string title, string mode, string shortcut = "")
+    {
+        var item = MenuAction(title, () => _ = StartRecordingAsync(mode), shortcut);
+        _recordingStartActions.Add(item);
+        return item;
+    }
+
+    private void ShowRecordingMenu(Button owner)
+    {
+        var menu = new ContextMenu { PlacementTarget = owner, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        menu.Items.Add(MenuAction("範囲を録画…", () => _ = StartRecordingAsync("region"), "Ctrl+Shift+7"));
+        menu.Items.Add(MenuAction("モニター全体を録画…", () => _ = StartRecordingAsync("full")));
+        menu.IsOpen = true;
+    }
+
+    private void UpdateRecordingControls()
+    {
+        bool active = _recordingTask is not null;
+        foreach (var item in _captureActions) item.IsEnabled = !active && !_snapping;
+        foreach (var item in _recordingStartActions) item.IsEnabled = !active && !_snapping;
+        foreach (var item in _historyActions) item.IsEnabled = !active && !_snapping;
+        if (_stopRecordingItem is not null) _stopRecordingItem.IsEnabled = _recorder is not null && !_recordingBusy;
+        _host?.SetRecordingState(_recorder is not null, _recordingBusy || _snapping);
     }
 
     private void ShowSnapMenu(Button owner)
@@ -289,6 +369,7 @@ public sealed class MainWindow : Window
     {
         _statusTimer.Stop();
         _status.Text = text;
+        _status.ToolTip = text;
         if (milliseconds > 0)
         {
             _statusTimer.Interval = TimeSpan.FromMilliseconds(milliseconds);
@@ -317,6 +398,41 @@ public sealed class MainWindow : Window
 
     public void OpenPath(string path) => Safe(() => { Editor.Open(path); ShowEditor(); });
 
+    public void ShowSaveHistory()
+    {
+        if (_exitRequested || _snapping || _recordingTask is not null) return;
+        ShowEditor();
+        if (_historyWindow is null)
+        {
+            var history = new SaveHistoryWindow(_savedFileHistory, text => ShowStatus(text, 8000)) { Owner = this };
+            _historyWindow = history;
+            history.Closed += (_, _) => { if (ReferenceEquals(_historyWindow, history)) _historyWindow = null; };
+            history.Show();
+        }
+        else
+        {
+            _historyWindow.Refresh();
+            if (_historyWindow.WindowState == WindowState.Minimized) _historyWindow.WindowState = WindowState.Normal;
+            _historyWindow.Activate();
+        }
+    }
+
+    private void CloseSaveHistory() => _historyWindow?.Close();
+
+    private string RememberSavedFile(string path)
+    {
+        try
+        {
+            if (_savedFileHistory.Add(path)) return "";
+            return $"（履歴の保存に失敗: {_savedFileHistory.LastError}）";
+        }
+        catch (Exception error)
+        {
+            // A history problem must never turn a completed image/video save into a failure.
+            return $"（履歴を記録できませんでした: {error.Message}）";
+        }
+    }
+
     private void OpenFile()
     {
         Editor.CommitText();
@@ -344,7 +460,8 @@ public sealed class MainWindow : Window
             path = dialog.FileName;
         }
         Editor.Document.Save(path);
-        ShowStatus($"保存しました: {path}");
+        string warning = RememberSavedFile(path);
+        ShowStatus($"保存しました: {path}{warning}", warning.Length > 0 ? 10000 : 3000);
     }
 
     private void CopyImage()
@@ -407,8 +524,10 @@ public sealed class MainWindow : Window
 
     public async Task SnapAsync(string mode)
     {
-        if (_snapping) return;
+        if (_snapping || _recordingTask is not null || _exitRequested) return;
+        CloseSaveHistory();
         _snapping = true;
+        UpdateRecordingControls();
         bool wasVisible = IsVisible;
         Editor.CommitText();
         Hide();
@@ -432,7 +551,149 @@ public sealed class MainWindow : Window
             if (wasVisible) ShowEditor();
             App.ReportError(error);
         }
-        finally { _snapping = false; }
+        finally { _snapping = false; UpdateRecordingControls(); }
+    }
+
+    public Task StartRecordingAsync(string mode)
+    {
+        if (_snapping || _recordingTask is not null || _exitRequested) return Task.CompletedTask;
+        CloseSaveHistory();
+        _recordingBusy = true;
+        _recordingCancellation = new CancellationTokenSource();
+        _recordingTask = RecordAsync(mode, _recordingCancellation);
+        UpdateRecordingControls();
+        return _recordingTask;
+    }
+
+    private async Task RecordAsync(string mode, CancellationTokenSource cancellation)
+    {
+        // Publish the session task before modal dialogs or other dispatcher work can reenter.
+        await Task.Yield();
+        bool wasVisible = IsVisible;
+        string? savedPath = null;
+        Exception? failure = null;
+        try
+        {
+            cancellation.Token.ThrowIfCancellationRequested();
+            // Remember the target monitor before the save dialog moves the cursor.
+            Int32Rect? bounds = mode == "full" ? ScreenCapture.MonitorAtCursor() : null;
+            Editor.CommitText();
+            if (!IsVisible) ShowEditor();
+            string directory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+            var dialog = new SaveFileDialog { Title = "動画の保存先を選択", Filter = "MP4 動画|*.mp4",
+                DefaultExt = ".mp4", AddExtension = true, FileName = $"WinSkitch-{DateTime.Now:yyyyMMdd-HHmmss}.mp4",
+                InitialDirectory = Directory.Exists(directory) ? directory : PicturesDirectory() };
+            _recordingSaveDialogOpen = true;
+            try { if (dialog.ShowDialog(this) != true) return; }
+            finally { _recordingSaveDialogOpen = false; }
+            Hide();
+            await Task.Delay(250, cancellation.Token);
+            if (bounds is null)
+            {
+                var capture = ScreenCapture.CaptureDesktop();
+                bounds = await CaptureOverlay.SelectAsync(capture, cancellation.Token);
+            }
+            if (bounds is null) return;
+            await RecordingCountdownAsync(cancellation);
+            cancellation.Token.ThrowIfCancellationRequested();
+            var recorder = await VideoRecorder.StartAsync(dialog.FileName, bounds.Value);
+            _recorder = recorder;
+            if (cancellation.IsCancellationRequested)
+            {
+                await recorder.StopAsync();
+                savedPath = dialog.FileName;
+                return;
+            }
+            _recordingControls = new RecordingControlsWindow(() => recorder.Elapsed, () => _ = StopRecordingAsync());
+            _recordingControls.Show();
+            _recordingBusy = false;
+            UpdateRecordingControls();
+            await recorder.Completion;
+            savedPath = dialog.FileName;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception error) { failure = error; }
+        finally
+        {
+            // Completion owns encoder/capture cleanup. Stop also covers UI setup failures.
+            if (_recorder is { } recorder)
+            {
+                try { await recorder.StopAsync(); }
+                catch (Exception error) { failure ??= error; }
+            }
+            _recordingControls?.CloseAfterRecording();
+            _recordingControls = null;
+            _recorder = null;
+            _recordingTask = null;
+            _recordingCancellation = null;
+            _recordingBusy = false;
+            cancellation.Dispose();
+            UpdateRecordingControls();
+            string historyWarning = savedPath is not null && failure is null ? RememberSavedFile(savedPath) : "";
+            if (failure is not null)
+            {
+                // Keep a failed save visible even when shutdown triggered the stop.
+                _exitRequested = false;
+                ShowEditor();
+                App.ReportError(failure);
+                _host?.ShowNotification($"録画できませんでした: {failure.Message}");
+            }
+            else if (!_exitRequested)
+            {
+                if (wasVisible || savedPath is not null) ShowEditor();
+                else Hide();
+                if (savedPath is not null)
+                {
+                    ShowStatus($"動画を保存しました: {savedPath}{historyWarning}", 10000);
+                    _host?.ShowNotification($"動画を保存しました: {savedPath}");
+                }
+            }
+        }
+    }
+
+    public async Task StopRecordingAsync()
+    {
+        var recorder = _recorder;
+        if (recorder is null)
+        {
+            _recordingCancellation?.Cancel();
+            return;
+        }
+        if (_recordingBusy) return;
+        _recordingBusy = true;
+        _recordingControls?.BeginSaving();
+        UpdateRecordingControls();
+        try { await recorder.StopAsync(); }
+        catch { /* RecordAsync reports completion failures once and restores the UI. */ }
+    }
+
+    private static async Task RecordingCountdownAsync(CancellationTokenSource cancellation)
+    {
+        var number = new TextBlock { FontSize = 42, FontWeight = FontWeights.Bold,
+            HorizontalAlignment = HorizontalAlignment.Center };
+        var panel = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        panel.Children.Add(number);
+        panel.Children.Add(new TextBlock { Text = "録画開始 • Escで中止", FontSize = 12, HorizontalAlignment = HorizontalAlignment.Center });
+        var countdown = new Window { Title = "WinSkitch — 録画の準備", WindowStyle = WindowStyle.None,
+            ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false, Topmost = true, Width = 200, Height = 110,
+            Background = new SolidColorBrush(Color.FromRgb(32, 32, 32)), Foreground = Brushes.White,
+            Content = panel, WindowStartupLocation = WindowStartupLocation.CenterScreen };
+        countdown.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape) { cancellation.Cancel(); e.Handled = true; }
+        };
+        try
+        {
+            countdown.Show();
+            countdown.Activate();
+            for (int n = 3; n > 0; n--)
+            {
+                number.Text = n.ToString();
+                await Task.Delay(1000, cancellation.Token);
+            }
+        }
+        finally { countdown.Close(); }
+        await Task.Delay(200, cancellation.Token);
     }
 
     private async Task CountdownAsync()
@@ -454,7 +715,14 @@ public sealed class MainWindow : Window
 
     public void ShowEditor()
     {
-        if (_allowExit) return;
+        if (_allowExit || _exitRequested) return;
+        if (_recordingControls is { } controls)
+        {
+            controls.Show();
+            if (controls.WindowState == WindowState.Minimized) controls.WindowState = WindowState.Normal;
+            controls.Activate();
+            return;
+        }
         Show();
         if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         Activate();
@@ -470,6 +738,7 @@ public sealed class MainWindow : Window
     private void HideEditor()
     {
         Editor.CommitText();
+        CloseSaveHistory();
         Hide();
         _host?.ShowHiddenHint();
     }
@@ -480,6 +749,42 @@ public sealed class MainWindow : Window
     }
 
     public void Exit()
+    {
+        if (_exitRequested) return;
+        _exitRequested = true;
+        if (_recordingTask is { } recordingTask)
+        {
+            _recordingCancellation?.Cancel();
+            DismissRecordingSaveDialog();
+            _ = ExitAfterRecordingAsync(recordingTask);
+            return;
+        }
+        ExitImmediately();
+    }
+
+    private async Task ExitAfterRecordingAsync(Task recordingTask)
+    {
+        await StopRecordingAsync();
+        await recordingTask;
+        if (_exitRequested) ExitImmediately();
+    }
+
+    private void DismissRecordingSaveDialog()
+    {
+        if (!_recordingSaveDialogOpen) return;
+        IntPtr owner = new WindowInteropHelper(this).Handle;
+        NativeMethods.EnumWindowsProc callback = (window, _) =>
+        {
+            // Only close the native dialog owned by this recording's editor window.
+            if (NativeMethods.GetWindow(window, 4) == owner)
+                NativeMethods.PostMessage(window, 0x0010, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        };
+        NativeMethods.EnumWindows(callback, IntPtr.Zero);
+        GC.KeepAlive(callback);
+    }
+
+    private void ExitImmediately()
     {
         _allowExit = true;
         _host?.Dispose();
