@@ -10,7 +10,7 @@ Windows 用の画面キャプチャ・画像注釈アプリです。矢印や文
 
 *Windows 版の実際の画面部品を描画した使用例です。編集対象は説明用に作成したサンプル画像です。*
 
-[使い始める](#使い始める) · [使い方](#基本の使い方) · [常駐・自動起動](#常駐と自動起動) · [ビルド・配布](#開発と配布) · [Python 版](python/README.md)
+[ダウンロード](https://github.com/1000ri-jp/win_skitch/releases/latest) · [使い始める](#使い始める) · [使い方](#基本の使い方) · [常駐・自動起動](#常駐と自動起動) · [ビルド・配布](#開発と配布) · [Python 版](python/README.md)
 
 ## できること
 
@@ -28,6 +28,17 @@ Windows 用の画面キャプチャ・画像注釈アプリです。矢印や文
 ![キャプチャ、注釈、共有という3段階の使い方](docs/images/workflow.png)
 
 ## 使い始める
+
+### GitHub からダウンロード
+
+[Releases](https://github.com/1000ri-jp/win_skitch/releases/latest) から、お使いの PC に合った ZIP をダウンロードして展開してください。
+
+| 対象 PC | v1.0.0 のダウンロード |
+| --- | --- |
+| 通常の x64 PC（Intel / AMD） | [WinSkitch-v1.0.0-win-x64.zip](https://github.com/1000ri-jp/win_skitch/releases/download/v1.0.0/WinSkitch-v1.0.0-win-x64.zip) |
+| ARM64 PC | [WinSkitch-v1.0.0-win-arm64.zip](https://github.com/1000ri-jp/win_skitch/releases/download/v1.0.0/WinSkitch-v1.0.0-win-arm64.zip) |
+
+ZIP には `WinSkitch.exe` と使い方の `README.txt` が入っています。展開した EXE をダブルクリックすれば起動できます。ARM64 版はクロスビルドしており、実機での動作確認は未実施です。配布ファイルの SHA-256 は Release の `SHA256SUMS.txt` で確認できます。
 
 ### WinSkitch.exe を受け取った場合
 
