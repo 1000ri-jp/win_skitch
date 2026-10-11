@@ -73,25 +73,36 @@ public sealed class Annotation
             Points[i] += delta;
     }
 
-    public IReadOnlyList<(string Name, Point Position)> Handles
+    public IReadOnlyList<(string Name, Point Position)> Handles => GetHandles();
+
+    public IReadOnlyList<(string Name, Point Position)> GetHandles(bool includeEdges = false)
     {
-        get
+        if (Kind == AnnotationKind.Arrow || Kind == AnnotationKind.Line)
+            return new[] { ("p0", Start), ("p1", End) };
+        if (Kind == AnnotationKind.Stamp)
         {
-            if (Kind == AnnotationKind.Arrow || Kind == AnnotationKind.Line)
-                return new[] { ("p0", Start), ("p1", End) };
-            if (Kind == AnnotationKind.Stamp)
-            {
-                double diagonal = EffectiveWidth / Math.Sqrt(2);
-                return new[] { ("r", new Point(Start.X + diagonal, Start.Y + diagonal)) };
-            }
-            if (IsBox)
+            double diagonal = EffectiveWidth / Math.Sqrt(2);
+            return new[] { ("r", new Point(Start.X + diagonal, Start.Y + diagonal)) };
+        }
+        if (IsBox)
+        {
+            if (includeEdges)
                 return new[]
                 {
                     ("x0y0", Start), ("x1y0", new Point(End.X, Start.Y)),
-                    ("x0y1", new Point(Start.X, End.Y)), ("x1y1", End)
+                    ("x0y1", new Point(Start.X, End.Y)), ("x1y1", End),
+                    ("x0", new Point(Start.X, (Start.Y + End.Y) / 2)),
+                    ("x1", new Point(End.X, (Start.Y + End.Y) / 2)),
+                    ("y0", new Point((Start.X + End.X) / 2, Start.Y)),
+                    ("y1", new Point((Start.X + End.X) / 2, End.Y))
                 };
-            return Array.Empty<(string Name, Point Position)>();
+            return new[]
+            {
+                ("x0y0", Start), ("x1y0", new Point(End.X, Start.Y)),
+                ("x0y1", new Point(Start.X, End.Y)), ("x1y1", End)
+            };
         }
+        return Array.Empty<(string Name, Point Position)>();
     }
 
     public void SetHandle(string name, Point position)
@@ -106,6 +117,10 @@ public sealed class Annotation
                 break;
             case "x0y0": Start = position; break;
             case "x1y1": End = position; break;
+            case "x0": Start = new Point(position.X, Start.Y); break;
+            case "x1": End = new Point(position.X, End.Y); break;
+            case "y0": Start = new Point(Start.X, position.Y); break;
+            case "y1": End = new Point(End.X, position.Y); break;
             case "x1y0":
                 Start = new Point(Start.X, position.Y);
                 End = new Point(position.X, End.Y);

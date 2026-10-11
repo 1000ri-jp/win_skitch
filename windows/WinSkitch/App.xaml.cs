@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
 
@@ -13,6 +15,11 @@ public partial class App : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (e.Args.Length == 2 && e.Args[0] == "--apply-update")
+        {
+            _ = ApplyUpdateAndExitAsync(e.Args[1]);
+            return;
+        }
         // Exercise the actual published entry point and embedded resources without
         // displaying a window, capturing the desktop, or changing the clipboard.
         if (e.Args.Length == 2 && e.Args[0] == "--smoke-test")
@@ -36,6 +43,7 @@ public partial class App : Application
         if (!_instance.IsPrimary)
         {
             if (!options.StartInTray) _instance.RequestShow();
+            SignalUpdateStartupReady();
             Shutdown();
             return;
         }
@@ -44,7 +52,28 @@ public partial class App : Application
             ReportError(args.Exception);
             args.Handled = true;
         };
-        StartWindow(options);
+        MainWindow window = StartWindow(options);
+        SignalUpdateStartupReady();
+        window.StartUpdateChecks();
+    }
+
+    internal static void SignalUpdateStartupReady()
+    {
+        string? name = Environment.GetEnvironmentVariable(UpdateInstaller.StartupReadyVariable);
+        Environment.SetEnvironmentVariable(UpdateInstaller.StartupReadyVariable, null);
+        const string prefix = @"Local\WinSkitch.Update.Started.";
+        if (name is null || !name.StartsWith(prefix, StringComparison.Ordinal) ||
+            !Guid.TryParseExact(name[prefix.Length..], "N", out _)) return;
+        try { using var ready = EventWaitHandle.OpenExisting(name); ready.Set(); }
+        catch (WaitHandleCannotBeOpenedException) { }
+    }
+
+    private async Task ApplyUpdateAndExitAsync(string manifestPath)
+    {
+        int exitCode = 0;
+        try { await UpdateInstaller.ApplyAsync(manifestPath, CancellationToken.None); }
+        catch (Exception error) { exitCode = 1; ReportError(error); }
+        finally { Shutdown(exitCode); }
     }
 
     private MainWindow StartWindow(LaunchOptions options)

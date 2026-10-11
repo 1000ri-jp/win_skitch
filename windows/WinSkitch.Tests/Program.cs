@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -20,6 +21,26 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--apply-update")
+        {
+            try { UpdateInstaller.ApplyAsync(args[1], CancellationToken.None).GetAwaiter().GetResult(); return 0; }
+            catch (Exception error) { File.WriteAllText(Path.Combine(Path.GetDirectoryName(args[1])!, "helper-error.txt"), error.ToString()); return 1; }
+        }
+        if (args.Length == 0 && Environment.GetEnvironmentVariable("WINSKITCH_UPDATE_TEST_REPORT") is string restartReport)
+        {
+            if (Environment.GetEnvironmentVariable("WINSKITCH_UPDATE_TEST_FAIL_STARTUP") == "1")
+            { File.WriteAllText(restartReport, "startup failed"); return 42; }
+            File.WriteAllText(restartReport, "restarted"); App.SignalUpdateStartupReady(); Thread.Sleep(100); return 0;
+        }
+        if (args.Length == 1 && args[0] == "--update-test-parent") { Thread.Sleep(750); return 0; }
+        if (args.Length == 3 && args[0] == "--resident-test-client")
+        {
+            using var duplicate = new ResidentInstance(() => { }, args[1]);
+            if (duplicate.IsPrimary) return 2;
+            File.WriteAllText(args[2], duplicate.PrimaryProcessId.ToString());
+            duplicate.RequestShow();
+            return 0;
+        }
         _output = Path.GetFullPath(args.Length > 0 ? args[0] : Path.Combine("artifacts", "qa"));
         Directory.CreateDirectory(_output);
         // Initialize resources without starting the application, tray, hotkeys, or any screen capture.
@@ -53,12 +74,15 @@ internal static class Program
         Run("a locked video destination preserves the finished recording for recovery", VideoPublishFailure);
         Run("recording controls show elapsed time and save state without opening a window", RecordingControls);
         Run("text editing commits, undoes, and restores visibility", TextEditing);
+        Run("committed text drags with the text tool and double-clicks to edit", TextDragging);
+        Run("crop side handles resize one axis and retain corner handles", CropEdgeHandles);
         Run("launch arguments distinguish tray startup from editor and image startup", LaunchArguments);
         Run("launch arguments reject ambiguous startup requests", InvalidLaunchArguments);
         Run("startup command preserves spaces and Japanese executable paths", StartupCommand);
         Run("startup command rejects unsafe or incomplete executable paths", InvalidStartupCommands);
         Run("startup registration selects the app executable instead of the dotnet host", StartupExecutable);
         Run("a second launch signals the existing resident and exits independently", ResidentActivation);
+        UpdatesTests.RunAll(Run, _output);
         Run("offscreen main window layout and image editing render", MainWindowRender);
         application.Shutdown();
         Console.WriteLine($"\n{_passed} passed, {_failed} failed. Visual artifacts: {_output}");
@@ -341,7 +365,7 @@ internal static class Program
             "the twenty most recent saves should be presented newest first");
 
         string repeated = Path.Combine(directory, ".", Path.GetFileName(paths[8])).ToUpperInvariant();
-        Check(history.Add(repeated), "saving again should accept equivalent absolute Windows paths");
+        Check(history.Add(repeated), $"saving again should accept equivalent absolute Windows paths: {history.LastError}");
         Equal(20, history.Entries.Count, "saving an existing destination must not consume an extra slot");
         Equal(Path.GetFullPath(repeated), history.Entries[0].FilePath, "the repeated normalized path should move to the top");
         Equal(1, history.Entries.Count(entry => string.Equals(entry.FilePath, paths[8], StringComparison.OrdinalIgnoreCase)),
@@ -690,6 +714,96 @@ internal static class Program
         SavePng(RenderElement(editor, 500, 300), "editor-text.png");
     }
 
+    private static void TextDragging()
+    {
+        foreach (string tool in new[] { "text", "arrow" })
+        {
+            var editor = new EditorSurface();
+            editor.Load(Solid(320, 200, Colors.White));
+            Layout(editor, 500, 300);
+            editor.SetTool("text");
+            var start = new Point(20, 20);
+            editor.BeginGesture(start, 1);
+            Check(editor.IsEditingText, "clicking empty space with the text tool starts text entry");
+            Descendants(editor).OfType<TextBox>().Single().Text = "移動する文字\n二行目";
+            editor.CommitText();
+            editor.SetTool(tool);
+            Annotation text = editor.Document.Annotations.Single();
+            Point hit = new(text.Bounds.Left + text.Bounds.Width / 2, text.Bounds.Top + text.Bounds.Height / 2);
+            BitmapSource before = editor.Document.Flatten();
+            editor.BeginGesture(hit, 1);
+            Check(!editor.IsEditingText && ReferenceEquals(text, editor.Selected), "a single click selects committed text for movement");
+            editor.FinishGesture();
+            editor.BeginGesture(hit, 1);
+            editor.UpdateGesture(hit + new Vector(15, -4));
+            editor.UpdateGesture(hit + new Vector(27, -10));
+            editor.FinishGesture();
+            Point moved = start + new Vector(27, -10);
+            Near(0, (text.Start - moved).Length, 0.000001, "dragging must translate text by the entire gesture delta");
+            Equal(1, editor.Document.Annotations.Count, "dragging must not create duplicate text");
+            Check(!text.Hidden && !editor.IsEditingText, "dragging leaves text visible without opening the inline editor");
+            Check(ChangedPixels(before, editor.Document.Flatten()) > 200, "exported text must appear at its new position");
+            editor.Undo();
+            Equal(start, editor.Document.Annotations.Single().Start, "one undo restores the complete text drag");
+            editor.Undo();
+            Equal(0, editor.Document.Annotations.Count, "a plain selection must not add an undo step");
+            editor.Redo();
+            editor.Redo();
+            text = editor.Document.Annotations.Single();
+            Near(0, (text.Start - moved).Length, 0.000001, "redo restores the text move");
+            hit += new Vector(27, -10);
+            editor.BeginGesture(hit, 1);
+            editor.FinishGesture();
+            editor.BeginGesture(hit, 2);
+            Check(editor.IsEditingText && text.Hidden, "double-clicking committed text opens its inline editor");
+            TextBox textbox = Descendants(editor).OfType<TextBox>().Single();
+            Equal(text.Text, textbox.Text, "re-editing preserves the existing multiline content");
+            textbox.Text = "再編集";
+            editor.CommitText();
+            Near(0, (text.Start - moved).Length, 0.000001, "editing after dragging must keep the moved position");
+            Equal(1, editor.Document.Annotations.Count, "re-editing updates the same text annotation");
+        }
+    }
+
+    private static void CropEdgeHandles()
+    {
+        var box = new Annotation { Kind = AnnotationKind.Rectangle, Start = new Point(), End = new Point(240, 160) };
+        Equal(4, box.Handles.Count, "ordinary box annotations keep their existing corner handles");
+        Equal(8, box.GetHandles(includeEdges: true).Count, "crop boxes expose four corners and four edge midpoints");
+        foreach (var (origin, destination, expected) in new[]
+        {
+            (new Point(0, 80), new Point(24, 97), new Rect(24, 0, 216, 160)),
+            (new Point(240, 80), new Point(205, 98), new Rect(0, 0, 205, 160)),
+            (new Point(120, 0), new Point(147, 18), new Rect(0, 18, 240, 142)),
+            (new Point(120, 160), new Point(141, 135), new Rect(0, 0, 240, 135)),
+            (new Point(0, 0), new Point(24, 18), new Rect(24, 18, 216, 142)),
+            (new Point(240, 80), new Point(260, 91), new Rect(0, 0, 260, 160))
+        })
+        {
+            var editor = new EditorSurface();
+            editor.Load(CoordinatePattern(240, 160));
+            Layout(editor, 500, 300);
+            editor.Document.Annotations.Add(new Annotation { Kind = AnnotationKind.Text, Start = new Point(100, 0), Text = "crop", Width = 20 });
+            editor.SetTool("crop");
+            SavePng(RenderElement(editor, 500, 300), "editor-crop-handles.png");
+            // A double click over text must still operate the crop handle.
+            editor.BeginGesture(origin, 2);
+            Check(!editor.IsEditingText, "crop gestures must take priority over text editing");
+            editor.UpdateGesture(destination);
+            editor.FinishGesture();
+            editor.ApplyCrop();
+            Equal((int)expected.Width, editor.Document.Background!.PixelWidth, "crop handle sets the intended width");
+            Equal((int)expected.Height, editor.Document.Background.PixelHeight, "crop handle sets the intended height");
+            Equal(new Point(100 - expected.X, -expected.Y), editor.Document.Annotations.Single().Start,
+                "crop shifts annotations only by the edge that moved");
+            if (expected.Width > 240)
+                Equal(new Pixel(255, 255, 255, 255), ReadPixel(editor.Document.Background, 250, 100), "outward edge dragging adds white margins");
+            editor.Undo();
+            Equal(240, editor.Document.Background.PixelWidth, "undo restores image width before cropping");
+            Equal(160, editor.Document.Background.PixelHeight, "undo restores image height before cropping");
+        }
+    }
+
     private static void LaunchArguments()
     {
         LaunchOptions normal = LaunchOptions.Parse(Array.Empty<string>());
@@ -778,8 +892,23 @@ internal static class Program
             Check(primary.IsPrimary, "the first resident must retain the instance handles");
             using var duplicate = new ResidentInstance(() => { }, name);
             Check(!duplicate.IsPrimary, "a second process request must not become another resident");
+            Equal(Environment.ProcessId, duplicate.PrimaryProcessId, "foreground permission must target the existing resident process");
             duplicate.RequestShow();
             Check(shown.Wait(TimeSpan.FromSeconds(2)), "a second manual launch must signal the existing editor to open");
+            shown.Reset();
+            string report = Path.Combine(_output, "resident-process-id.txt");
+            var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "WinSkitch.Tests.exe"))
+            {
+                UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden
+            };
+            start.ArgumentList.Add("--resident-test-client");
+            start.ArgumentList.Add(name);
+            start.ArgumentList.Add(report);
+            using Process client = Process.Start(start)!;
+            if (!client.WaitForExit(10_000)) { client.Kill(); throw new InvalidOperationException("duplicate launch did not exit"); }
+            Equal(0, client.ExitCode, "a duplicate launched in another process must exit successfully");
+            Equal(Environment.ProcessId.ToString(), File.ReadAllText(report), "a separate process reads the primary PID before signaling");
+            Check(shown.Wait(TimeSpan.FromSeconds(2)), "a separate process launch must activate the primary listener");
         }
         using var replacement = new ResidentInstance(() => { }, name);
         Check(replacement.IsPrimary, "exiting the resident must release handles for the next launch");
@@ -802,6 +931,13 @@ internal static class Program
         Check(CountPixels(screenshot, p => p.A == 255) > 500_000, "complete editor layout should render an opaque usable surface");
         Check(CountPixels(screenshot, p => p.R > p.G + 60 && p.R > p.B + 60) > 300, "loaded image annotations should be visible in the main editor");
         SavePng(screenshot, "main-window.png");
+        CheckBox startup = Descendants(content).OfType<CheckBox>().Single(box => box.Content?.ToString() == "ログイン時に起動");
+        double startupWidth = startup.ActualWidth;
+        Layout(content, 480, 360);
+        Rect startupBounds = startup.TransformToAncestor(content).TransformBounds(new Rect(startup.RenderSize));
+        Check(new Rect(0, 0, 480, 360).Contains(startupBounds), "the startup toggle must remain visible at the minimum window size");
+        Near(startupWidth, startup.ActualWidth, 0.001, "the startup label must fit at the minimum window size");
+        SavePng(RenderElement(content, 480, 360), "main-window-narrow.png");
     }
 
     private static IEnumerable<DependencyObject> Descendants(DependencyObject root)

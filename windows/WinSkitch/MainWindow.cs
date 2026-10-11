@@ -38,12 +38,25 @@ public sealed class MainWindow : Window
     private readonly TextBlock _status = new() { VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _info = new() { VerticalAlignment = VerticalAlignment.Center, Foreground = GrayBrush };
     private readonly DispatcherTimer _statusTimer = new();
+    private readonly DispatcherTimer _updateTimer = new() { Interval = TimeSpan.FromHours(6) };
+    private readonly CancellationTokenSource _updateCancellation = new();
+    private AppUpdates? _updates;
+    private PreparedUpdate? _preparedUpdate;
+    private Button? _updateButton;
+    private MenuItem? _updateItem;
+    private bool _updateBusy, _updateApplying;
     private readonly Dictionary<string, Button> _tools = new();
     private readonly Dictionary<Color, Button> _swatches = new();
     private readonly List<Button> _sizes = new();
     private readonly List<Control> _requiresImage = new();
     private MenuItem? _undoItem, _redoItem;
     private MenuItem? _startupItem;
+    private readonly CheckBox _startupCheck = new()
+    {
+        Content = "ログイン時に起動", VerticalAlignment = VerticalAlignment.Center,
+        VerticalContentAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 12, 0),
+        Cursor = Cursors.Hand, ToolTip = "Windowsへのログイン時に、タスクトレイでWinSkitchを起動します"
+    };
     private Point? _exportStart;
     private static Brush GrayBrush => new SolidColorBrush(Color.FromRgb(160, 160, 160));
     private static Brush BarBrush => new SolidColorBrush(Color.FromRgb(48, 48, 48));
@@ -65,7 +78,7 @@ public sealed class MainWindow : Window
     public MainWindow(SavedFileHistory? history = null)
     {
         _savedFileHistory = history ?? new SavedFileHistory();
-        Title = "WinSkitch";
+        Title = $"WinSkitch v{AppUpdates.CurrentVersion}";
         Width = 1000; Height = 700; MinWidth = 480; MinHeight = 360;
         FontFamily = new FontFamily("Yu Gothic UI");
         FontSize = 13;
@@ -85,8 +98,14 @@ public sealed class MainWindow : Window
             if (_host.FailedHotkeys) ShowStatus("⚠ ホットキーを登録できませんでした（他のアプリが使用中の可能性）", 0);
         };
         Closing += OnClosing;
-        Closed += (_, _) => { _host?.Dispose(); _statusTimer.Stop(); };
+        Closed += (_, _) =>
+        {
+            _host?.Dispose(); _statusTimer.Stop(); _updateTimer.Stop();
+            _updateCancellation.Cancel(); _updates?.Dispose();
+        };
+        _updateTimer.Tick += (_, _) => _ = CheckForUpdatesAsync(false);
         PreviewKeyDown += OnKeyDown;
+        Activated += (_, _) => UpdateStartupControls();
         AllowDrop = true;
         PreviewDragOver += (_, e) =>
         {
@@ -100,6 +119,7 @@ public sealed class MainWindow : Window
         };
         UpdateControls();
         UpdateRecordingControls();
+        UpdateStartupControls();
     }
 
     private void BuildLayout()
@@ -137,6 +157,12 @@ public sealed class MainWindow : Window
         history.ToolTip = "保存した画像・動画のファイルや保存先を開きます";
         actions.Children.Add(history);
         _historyActions.Add(history);
+        _updateButton = Button("更新を確認", () => _ = UpdateButtonAsync());
+        _updateButton.ToolTip = $"現在のバージョン: {AppUpdates.CurrentVersion}。最新版を確認します。";
+        actions.Children.Add(_updateButton);
+        _startupCheck.Click += (_, _) => ToggleStartup();
+        DockPanel.SetDock(_startupCheck, Dock.Right);
+        top.Children.Add(_startupCheck);
         DockPanel.SetDock(actions, Dock.Left);
         top.Children.Add(actions);
         _info.Margin = new Thickness(0, 0, 12, 0);
@@ -277,7 +303,10 @@ public sealed class MainWindow : Window
         _startupItem = new MenuItem { Header = "Windowsログイン時に起動", IsCheckable = true };
         _startupItem.Click += (_, _) => ToggleStartup();
         settings.Items.Add(_startupItem);
-        settings.SubmenuOpened += (_, _) => _startupItem.IsChecked = StartupRegistration.IsEnabled;
+        settings.SubmenuOpened += (_, _) => UpdateStartupControls();
+        settings.Items.Add(new Separator());
+        _updateItem = MenuAction("更新を確認…", () => _ = UpdateButtonAsync());
+        settings.Items.Add(_updateItem);
         menu.Items.Add(settings);
         return menu;
     }
@@ -322,12 +351,100 @@ public sealed class MainWindow : Window
 
     private void UpdateRecordingControls()
     {
-        bool active = _recordingTask is not null;
+        bool active = _recordingTask is not null || _updateApplying;
         foreach (var item in _captureActions) item.IsEnabled = !active && !_snapping;
         foreach (var item in _recordingStartActions) item.IsEnabled = !active && !_snapping;
         foreach (var item in _historyActions) item.IsEnabled = !active && !_snapping;
         if (_stopRecordingItem is not null) _stopRecordingItem.IsEnabled = _recorder is not null && !_recordingBusy;
-        _host?.SetRecordingState(_recorder is not null, _recordingBusy || _snapping);
+        _host?.SetRecordingState(_recorder is not null, _recordingBusy || _snapping || _updateApplying);
+        UpdateUpdateControls();
+    }
+
+    internal void StartUpdateChecks()
+    {
+        _updateTimer.Start();
+        _ = CheckForUpdatesAsync(false);
+    }
+
+    private void UpdateUpdateControls()
+    {
+        bool enabled = !_updateBusy && !_updateApplying && !_exitRequested && !_snapping && _recordingTask is null;
+        string label = _updateApplying ? "更新の準備中…" : _updateBusy ? "更新を取得中…" :
+            _preparedUpdate is not null ? "更新して再起動" : "更新を確認";
+        if (_updateButton is not null)
+        {
+            _updateButton.Content = label;
+            _updateButton.IsEnabled = enabled;
+            _updateButton.Background = _preparedUpdate is not null ? new SolidColorBrush(Color.FromRgb(61, 111, 182)) : BarBrush;
+            _updateButton.ToolTip = _preparedUpdate is null ? $"現在のバージョン: {AppUpdates.CurrentVersion}" :
+                $"v{_preparedUpdate.Release.Version}を取得しました。再起動して更新します。";
+        }
+        if (_updateItem is not null) { _updateItem.Header = label; _updateItem.IsEnabled = enabled; }
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_updateBusy || _updateApplying || _exitRequested || _preparedUpdate is not null) return;
+        _updateBusy = true;
+        UpdateUpdateControls();
+        try
+        {
+            _updates ??= new AppUpdates();
+            AppRelease? release = await _updates.CheckAsync(AppUpdates.CurrentVersion, _updateCancellation.Token);
+            if (release is null)
+            {
+                if (manual) ShowStatus($"v{AppUpdates.CurrentVersion}は最新です。", 5000);
+                return;
+            }
+            if (manual) ShowStatus($"v{release.Version}をダウンロードしています…", 0);
+            _preparedUpdate = await _updates.DownloadAsync(release, _updateCancellation.Token);
+            string message = $"v{release.Version}の準備ができました。「更新して再起動」で更新できます。";
+            ShowStatus(message, 10000);
+            if (!IsVisible) _host?.ShowNotification(message);
+        }
+        catch (Exception error)
+        {
+            // Offline startup and GitHub rate limits must never interrupt capture or editing.
+            if (manual && !_exitRequested) ShowStatus($"更新を取得できませんでした。後でもう一度お試しください。({error.Message})", 10000);
+        }
+        finally { _updateBusy = false; UpdateUpdateControls(); }
+    }
+
+    private async Task UpdateButtonAsync()
+    {
+        if (_preparedUpdate is null) { await CheckForUpdatesAsync(true); return; }
+        if (_updateApplying || _updateBusy || _exitRequested || _snapping || _recordingTask is not null) return;
+        Editor.CommitText();
+        if (Editor.Document.Background is not null)
+        {
+            MessageBoxResult answer = MessageBox.Show(this,
+                "画像を保存してから更新・再起動しますか？\n\n「はい」: 保存して更新\n「いいえ」: 保存せず更新（現在の編集内容は失われます）\n「キャンセル」: 編集を続ける",
+                "WinSkitchの更新", MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Cancel);
+            if (answer == MessageBoxResult.Cancel) return;
+            if (answer == MessageBoxResult.Yes)
+            {
+                try { if (!Save(false)) return; }
+                catch (Exception error) { App.ReportError(error); return; }
+            }
+        }
+        _updateApplying = true;
+        IsEnabled = false;
+        UpdateRecordingControls();
+        try
+        {
+            string appHost = Path.Combine(AppContext.BaseDirectory, "WinSkitch.exe");
+            string target = StartupRegistration.ResolveExecutablePath(Environment.ProcessPath, AppContext.BaseDirectory, File.Exists(appHost));
+            await UpdateInstaller.StartAsync(_preparedUpdate, target, _updateCancellation.Token);
+            _exitRequested = true;
+            ExitImmediately();
+        }
+        catch (Exception error)
+        {
+            _updateApplying = false;
+            IsEnabled = true;
+            UpdateRecordingControls();
+            ShowStatus($"更新できませんでした。現在のバージョンで続けられます。({error.Message})", 15000);
+        }
     }
 
     private void ShowSnapMenu(Button owner)
@@ -393,7 +510,14 @@ public sealed class MainWindow : Window
             ShowStatus(message);
             if (!IsVisible) _host?.ShowNotification(message);
         });
-        if (_startupItem is not null) _startupItem.IsChecked = StartupRegistration.IsEnabled;
+        UpdateStartupControls();
+    }
+
+    private void UpdateStartupControls()
+    {
+        bool enabled = StartupRegistration.IsEnabled;
+        _startupCheck.IsChecked = enabled;
+        if (_startupItem is not null) _startupItem.IsChecked = enabled;
     }
 
     public void OpenPath(string path) => Safe(() => { Editor.Open(path); ShowEditor(); });
@@ -446,22 +570,23 @@ public sealed class MainWindow : Window
         return Directory.Exists(path) ? path : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
     }
 
-    private void Save(bool saveAs)
+    private bool Save(bool saveAs)
     {
         Editor.CommitText();
-        if (Editor.Document.Background is null) return;
+        if (Editor.Document.Background is null) return false;
         string? path = Editor.Document.FilePath;
         if (saveAs || path is null)
         {
             var dialog = new SaveFileDialog { Filter = "PNG|*.png|JPEG|*.jpg;*.jpeg", DefaultExt = ".png", AddExtension = true,
                 FileName = Path.GetFileName(path ?? Editor.Document.FileName),
                 InitialDirectory = path is null ? PicturesDirectory() : Path.GetDirectoryName(path) };
-            if (dialog.ShowDialog(this) != true) return;
+            if (dialog.ShowDialog(this) != true) return false;
             path = dialog.FileName;
         }
         Editor.Document.Save(path);
         string warning = RememberSavedFile(path);
         ShowStatus($"保存しました: {path}{warning}", warning.Length > 0 ? 10000 : 3000);
+        return true;
     }
 
     private void CopyImage()
@@ -524,7 +649,7 @@ public sealed class MainWindow : Window
 
     public async Task SnapAsync(string mode)
     {
-        if (_snapping || _recordingTask is not null || _exitRequested) return;
+        if (_snapping || _recordingTask is not null || _exitRequested || _updateApplying) return;
         CloseSaveHistory();
         _snapping = true;
         UpdateRecordingControls();
@@ -556,7 +681,7 @@ public sealed class MainWindow : Window
 
     public Task StartRecordingAsync(string mode)
     {
-        if (_snapping || _recordingTask is not null || _exitRequested) return Task.CompletedTask;
+        if (_snapping || _recordingTask is not null || _exitRequested || _updateApplying) return Task.CompletedTask;
         CloseSaveHistory();
         _recordingBusy = true;
         _recordingCancellation = new CancellationTokenSource();
@@ -718,15 +843,19 @@ public sealed class MainWindow : Window
         if (_allowExit || _exitRequested) return;
         if (_recordingControls is { } controls)
         {
-            controls.Show();
-            if (controls.WindowState == WindowState.Minimized) controls.WindowState = WindowState.Normal;
-            controls.Activate();
+            BringToForeground(controls);
             return;
         }
-        Show();
-        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-        Activate();
-        Focus();
+        BringToForeground(this);
+    }
+
+    private static void BringToForeground(Window window)
+    {
+        window.Show();
+        if (window.WindowState == WindowState.Minimized) window.WindowState = WindowState.Normal;
+        window.Activate();
+        NativeMethods.SetForegroundWindow(new WindowInteropHelper(window).Handle);
+        window.Focus();
     }
 
     public void StartInTray()

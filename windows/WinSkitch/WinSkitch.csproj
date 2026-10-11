@@ -12,12 +12,13 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\WinSkitch.ico</ApplicationIcon>
     <DebugType>embedded</DebugType>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Description>Windows screen capture, recording, and annotation editor</Description>
     <!-- WPF owns DPI awareness through the manifest; WinForms is used only for the tray. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="WinSkitch.Tests" />
     <Resource Include="Assets\WinSkitch.png" />
     <Resource Include="Assets\WinSkitch.ico" />
   </ItemGroup>

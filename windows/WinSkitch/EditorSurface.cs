@@ -216,7 +216,7 @@ public sealed class EditorSurface : Grid
 
     private void DrawHandles(DrawingContext dc, Annotation annotation)
     {
-        foreach (var handle in annotation.Handles)
+        foreach (var handle in annotation.GetHandles(ReferenceEquals(annotation, _crop)))
             dc.DrawEllipse(Brushes.White, AccentPen(1.5), DisplayPoint(handle.Position), 4.5, 4.5);
     }
 
@@ -224,7 +224,7 @@ public sealed class EditorSurface : Grid
     {
         if (annotation is null) return null;
         double tolerance = 8 / _scale;
-        foreach (var handle in annotation.Handles)
+        foreach (var handle in annotation.GetHandles(ReferenceEquals(annotation, _crop)))
             if (Math.Abs(p.X - handle.Position.X) <= tolerance && Math.Abs(p.Y - handle.Position.Y) <= tolerance)
                 return handle.Name;
         return null;
@@ -240,12 +240,16 @@ public sealed class EditorSurface : Grid
             (ReferenceEquals(origin, _textBox) || _textBox.IsAncestorOf(origin))) return;
         if (_textBox is not null) { CommitText(); e.Handled = true; return; }
         Focus();
-        var p = ImagePoint(e.GetPosition(this));
+        BeginGesture(ImagePoint(e.GetPosition(this)), e.ClickCount);
+        e.Handled = true;
+    }
+
+    internal void BeginGesture(Point p, int clickCount)
+    {
         var hit = AnnotationAt(p);
-        if (e.ClickCount == 2 && hit?.Kind == AnnotationKind.Text)
+        if (Tool != "crop" && clickCount == 2 && hit?.Kind == AnnotationKind.Text)
         {
             StartText(hit.Start, hit);
-            e.Handled = true;
             return;
         }
         _start = _last = p;
@@ -271,12 +275,6 @@ public sealed class EditorSurface : Grid
         else if (hit is not null)
         {
             Selected = hit;
-            if (Tool == "text" && hit.Kind == AnnotationKind.Text)
-            {
-                StartText(hit.Start, hit);
-                e.Handled = true;
-                return;
-            }
             _dragMode = "move";
         }
         else
@@ -285,7 +283,6 @@ public sealed class EditorSurface : Grid
             if (Tool == "text")
             {
                 StartText(p);
-                e.Handled = true;
                 return;
             }
             _creating = CreateAnnotation(p);
@@ -297,7 +294,6 @@ public sealed class EditorSurface : Grid
         }
         if (_dragMode is not null) CaptureMouse();
         Refresh();
-        e.Handled = true;
     }
 
     private Annotation? CreateAnnotation(Point p)
@@ -350,6 +346,13 @@ public sealed class EditorSurface : Grid
             return;
         }
         if (e.LeftButton != MouseButtonState.Pressed) return;
+        UpdateGesture(p);
+        e.Handled = true;
+    }
+
+    internal void UpdateGesture(Point p)
+    {
+        if (_dragMode is null || _textBox is not null) return;
         if ((p - _last).Length < 0.001) return;
         switch (_dragMode)
         {
@@ -376,7 +379,6 @@ public sealed class EditorSurface : Grid
         _gestureChanged = true;
         _last = p;
         Refresh();
-        e.Handled = true;
     }
 
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
@@ -394,7 +396,7 @@ public sealed class EditorSurface : Grid
         if (_dragMode is not null) FinishGesture();
     }
 
-    private void FinishGesture()
+    internal void FinishGesture()
     {
         bool changed = _gestureChanged && _dragMode is "handle" or "move";
         if (_dragMode == "create" && _creating is not null)
